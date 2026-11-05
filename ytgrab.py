@@ -9,13 +9,23 @@ import os
 import sys
 import json
 import queue
+import socket
+import functools
 import threading
 import subprocess
 from shutil import which
 import urllib.request
+import urllib.parse
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+try:
+    import qrcode
+    HAVE_QR = True
+except Exception:
+    HAVE_QR = False
 
 try:
     import yt_dlp
@@ -116,9 +126,16 @@ class YTGrab(tk.Tk):
         self.thumb_ref = None
         self.msgq = queue.Queue()
         self._syncing = False
+        self.last_file = None
+        self._hook_file = None
+        self.share_server = None
+        self.share_thread = None
+        self.qr_win = None
+        self._qr_ref = None
 
         self._build_styles()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll_queue)
 
         if yt_dlp is None:
@@ -261,6 +278,11 @@ class YTGrab(tk.Tk):
         self.q_var = tk.StringVar(value=self.cfg.get("quality", "Best"))
         ttk.Combobox(opt, textvariable=self.q_var, values=["Best", "1080p", "720p", "480p"],
                      width=7, state="readonly").pack(side="left", padx=8)
+        ttk.Label(opt, text="   Sign-in").pack(side="left")
+        self.cookies_var = tk.StringVar(value=self.cfg.get("cookies", "None"))
+        ttk.Combobox(opt, textvariable=self.cookies_var,
+                     values=["None", "Chrome", "Edge", "Firefox", "Brave", "Opera"],
+                     width=8, state="readonly").pack(side="left", padx=6)
 
         # folder row
         frow = ttk.Frame(self)
@@ -278,7 +300,9 @@ class YTGrab(tk.Tk):
         drow = ttk.Frame(self)
         drow.pack(fill="x", pady=(12, 4), **pad)
         self.dl_btn = ttk.Button(drow, text="Download", style="Accent.TButton", command=self.start_download)
-        self.dl_btn.pack(fill="x")
+        self.dl_btn.pack(side="left", fill="x", expand=True)
+        self.share_btn = ttk.Button(drow, text="Send to device", command=self.start_share, state="disabled")
+        self.share_btn.pack(side="left", padx=(8, 0))
         self.prog = ttk.Progressbar(self, style="Horizontal.TProgressbar", mode="determinate", maximum=100)
         self.prog.pack(fill="x", pady=(8, 2), **pad)
         self.status = ttk.Label(self, text="Ready.", style="Muted.TLabel")
@@ -367,7 +391,7 @@ class YTGrab(tk.Tk):
 
     def _load_info_worker(self, url):
         try:
-            opts = {"quiet": True, "skip_download": True, "noplaylist": True}
+            opts = self._apply_cookies({"quiet": True, "skip_download": True, "noplaylist": True})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             self.msgq.put(("info", info))
@@ -424,8 +448,8 @@ class YTGrab(tk.Tk):
 
     def _preview_worker(self, url, t):
         try:
-            opts = {"quiet": True, "skip_download": True, "noplaylist": True,
-                    "format": "bv*[height<=720]/b[height<=720]/b"}
+            opts = self._apply_cookies({"quiet": True, "skip_download": True, "noplaylist": True,
+                    "format": "bv*[height<=720]/b[height<=720]/b"})
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             vurl = info.get("url")
@@ -473,13 +497,20 @@ class YTGrab(tk.Tk):
             clip = (s, e)
 
         # persist prefs
-        self.cfg.update({"folder": folder, "fmt": self.fmt_var.get(), "quality": self.q_var.get()})
+        self.cfg.update({"folder": folder, "fmt": self.fmt_var.get(),
+                         "quality": self.q_var.get(), "cookies": self.cookies_var.get()})
         save_config(self.cfg)
 
         self.dl_btn.configure(state="disabled")
         self.prog.configure(value=0)
         self._set_status("Starting…")
         threading.Thread(target=self._download_worker, args=(url, folder, clip), daemon=True).start()
+
+    def _apply_cookies(self, opts):
+        choice = self.cookies_var.get()
+        if choice and choice != "None":
+            opts["cookiesfrombrowser"] = (choice.lower(),)
+        return opts
 
     def _build_format(self):
         q = self.q_var.get()
@@ -502,6 +533,7 @@ class YTGrab(tk.Tk):
             spd_txt = f"{spd/1048576:.1f} MB/s" if spd else ""
             self.msgq.put(("status", f"Downloading… {spd_txt}"))
         elif st == "finished":
+            self._hook_file = d.get("filename")
             self.msgq.put(("prog", 100))
             self.msgq.put(("status", "Processing (merging / converting)…"))
 
@@ -530,12 +562,119 @@ class YTGrab(tk.Tk):
                 s, e = clip
                 opts["download_ranges"] = download_range_func(None, [(s, e)])
                 opts["force_keyframes_at_cuts"] = True
+            self._apply_cookies(opts)
 
+            final_path = None
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-            self.msgq.put(("done", folder))
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    rd = info.get("requested_downloads") or []
+                    if rd:
+                        final_path = rd[0].get("filepath")
+                    if not final_path:
+                        try:
+                            final_path = ydl.prepare_filename(info)
+                        except Exception:
+                            pass
+            if not final_path and self._hook_file and os.path.isfile(self._hook_file):
+                final_path = self._hook_file
+            self.msgq.put(("done", (folder, final_path)))
         except Exception as ex:
             self.msgq.put(("dl_err", str(ex)))
+
+    # ---- send to device (local Wi-Fi) ----
+    def _lan_ip(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+
+    def start_share(self):
+        if not self.last_file or not os.path.isfile(self.last_file):
+            messagebox.showinfo("YTGrab", "Download a video first, then send it.")
+            return
+        self.stop_share()
+        folder = os.path.dirname(self.last_file)
+        fname = os.path.basename(self.last_file)
+        handler = functools.partial(SimpleHTTPRequestHandler, directory=folder)
+        try:
+            self.share_server = ThreadingHTTPServer(("0.0.0.0", 0), handler)
+        except Exception as ex:
+            messagebox.showerror("YTGrab", f"Couldn't start sharing:\n\n{ex}")
+            return
+        port = self.share_server.server_address[1]
+        self.share_thread = threading.Thread(target=self.share_server.serve_forever, daemon=True)
+        self.share_thread.start()
+        url = f"http://{self._lan_ip()}:{port}/" + urllib.parse.quote(fname)
+        self._show_qr(url, fname)
+
+    def stop_share(self):
+        if self.share_server:
+            try:
+                self.share_server.shutdown()
+                self.share_server.server_close()
+            except Exception:
+                pass
+        self.share_server = None
+        self.share_thread = None
+        if self.qr_win is not None:
+            try:
+                self.qr_win.destroy()
+            except Exception:
+                pass
+            self.qr_win = None
+
+    def _show_qr(self, url, fname):
+        win = tk.Toplevel(self)
+        self.qr_win = win
+        win.title("Send to device")
+        win.configure(bg=self.CARD)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.stop_share)
+
+        ttk.Label(win, text="Scan with your phone's camera",
+                  style="Title.TLabel").pack(padx=20, pady=(18, 4))
+        ttk.Label(win, text="Phone must be on the same Wi-Fi.",
+                  style="CardMuted.TLabel").pack(padx=20)
+
+        if HAVE_QR:
+            try:
+                img = qrcode.make(url).resize((230, 230))
+                self._qr_ref = ImageTk.PhotoImage(img) if HAVE_PIL else None
+            except Exception:
+                self._qr_ref = None
+        if self._qr_ref is not None:
+            tk.Label(win, image=self._qr_ref, bg=self.CARD).pack(padx=20, pady=12)
+        else:
+            ttk.Label(win, text="(QR unavailable — use the link below)",
+                      style="CardMuted.TLabel").pack(padx=20, pady=12)
+
+        ttk.Label(win, text="…or open this link on the other device:",
+                  style="CardMuted.TLabel").pack(padx=20)
+        link = tk.Entry(win, font=("Segoe UI", 9), bg=self.BG, fg=self.TXT,
+                        insertbackground=self.TXT, relief="flat", justify="center",
+                        highlightthickness=1, highlightbackground=self.LINE)
+        link.insert(0, url)
+        link.configure(state="readonly")
+        link.pack(fill="x", padx=20, pady=(4, 2), ipady=5)
+
+        def copy_link():
+            self.clipboard_clear()
+            self.clipboard_append(url)
+
+        btns = ttk.Frame(win, style="Card.TFrame")
+        btns.pack(pady=12)
+        ttk.Button(btns, text="Copy link", command=copy_link).pack(side="left", padx=4)
+        ttk.Button(btns, text="Stop sharing", command=self.stop_share).pack(side="left", padx=4)
+
+    def _on_close(self):
+        self.stop_share()
+        self.destroy()
 
     # ---- queue poll ----
     def _poll_queue(self):
@@ -556,10 +695,14 @@ class YTGrab(tk.Tk):
                 elif kind == "status":
                     self._set_status(payload)
                 elif kind == "done":
+                    folder, fpath = payload
                     self.prog.configure(value=100)
                     self.dl_btn.configure(state="normal")
-                    self._set_status(f"Done · saved to {payload}")
-                    messagebox.showinfo("YTGrab", f"Download complete.\n\nSaved to:\n{payload}")
+                    self.last_file = fpath if (fpath and os.path.isfile(fpath)) else None
+                    self.share_btn.configure(state=("normal" if self.last_file else "disabled"))
+                    self._set_status(f"Done · saved to {folder}")
+                    extra = "\n\nTap “Send to device” to send it to your phone." if self.last_file else ""
+                    messagebox.showinfo("YTGrab", f"Download complete.\n\nSaved to:\n{folder}{extra}")
                 elif kind == "dl_err":
                     self.dl_btn.configure(state="normal")
                     self._set_status("Download failed.", error=True)

@@ -39,6 +39,28 @@ USING THE CLIP FEATURE
   5. Click Download. Only that section is pulled — not the whole video.
 
 ------------------------------------------------------------
+SEND TO DEVICE (phone / tablet / another PC)
+------------------------------------------------------------
+  After a download finishes, click "Send to device". A QR code pops up.
+  Scan it with your phone's camera (phone must be on the same Wi-Fi)
+  and the video downloads straight to the phone. Or tap "Copy link"
+  and open it on any device on your network.
+  Click "Stop sharing" when done (it also stops when you close YTGrab).
+  Note: the first time, Windows may ask to allow YTGrab through the
+  firewall on Private networks — click Allow.
+
+------------------------------------------------------------
+GETTING VIDEOS FROM (ALMOST) ANY SITE
+------------------------------------------------------------
+  The engine supports ~1,800 sites plus a generic mode for others,
+  so most links just work. For videos that need you logged in
+  (age-restricted, members-only, private), set the "Sign-in" dropdown
+  to the browser you're logged into (e.g. Chrome) and YTGrab will use
+  that browser's login.
+  Can't be downloaded by anything: DRM streams like Netflix / Disney+.
+  If a normally-working site breaks, update the engine (see below).
+
+------------------------------------------------------------
 NOTES
   - Your save folder and format are remembered between runs.
   - Frame preview is best-effort; if a site blocks it, the clip
